@@ -77,6 +77,7 @@ SYSTEM_PROMPT = """
 STOCK_NAME_LABEL = "分析したい銘柄名を入力してください"
 POSITION_LABEL = "あなたの立場を選択してください"
 POSITION_OPTIONS = ["注目株", "保有株"]
+PERIOD_OPTIONS = ["3ヶ月", "半年", "1年", "3年"]
 
 ADDITIONAL_INFO_LABEL = "補足情報（任意）"
 ADDITIONAL_INFO_PLACEHOLDER = (
@@ -87,3 +88,16 @@ EXECUTE_BUTTON_LABEL = "分析を実行"
 LOADING_MESSAGE = "投資判断を分析中です。しばらくお待ちください..."
 RESULT_SECTION_TITLE = "投資判断結果"
 ERROR_MESSAGE = "分析中にエラーが発生しました。もう一度お試しください。"
+
+# ===== サイドバーメニュー =====
+MENU_STOCK_REVIEW = "株の考察"
+MENU_CANDIDATE_STOCKS = "有力株の表示"
+MENU_CHART = "チャートの表示"
+MENU_TREND = "傾向分析"
+
+MENU_OPTIONS = [
+    MENU_CANDIDATE_STOCKS,
+    MENU_CHART,
+    MENU_TREND,
+    MENU_STOCK_REVIEW,
+]

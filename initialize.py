@@ -45,4 +45,4 @@ def initialize_app() -> None:
     load_environment()
     setup_page_config()
     initialize_session_state()
-    st.title(APP_TITLE)
+    # st.title(APP_TITLE)

@@ -49,7 +49,7 @@ class StockAdvisorService:
             HumanMessage(content=user_prompt),
         ]
 
-        response = self.llm(messages)
+        response = self.llm.invoke(messages)
         response_text = response.content
 
         decision_key = extract_decision_from_text(response_text)
