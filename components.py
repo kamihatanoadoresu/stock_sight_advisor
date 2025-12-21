@@ -22,6 +22,7 @@ from constants import (
     PERIOD_OPTIONS,
     TICKERS,
     TITLE_DICT,
+    get_tickers_and_names,
 )
 from utils import normalize_text
 from services import StockAdvisorService
@@ -269,7 +270,7 @@ def fetch_stock_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return df
 
 
-def create_candlestick_chart(ticker: str, period: str, interval: str):
+def create_candlestick_chart(ticker: str, period: str, interval: str, title_dict: dict = None):
     """
     Plotlyで単一銘柄のインタラクティブなローソク足チャートを作成
     """
@@ -279,7 +280,10 @@ def create_candlestick_chart(ticker: str, period: str, interval: str):
         if df.empty:
             return None
         
-        title_jp = TITLE_DICT.get(ticker, ticker)
+        # 銘柄名辞書が渡されない場合はTITLE_DICTを使用（後方互換）
+        if title_dict is None:
+            title_dict = TITLE_DICT
+        title_jp = title_dict.get(ticker, ticker)
         
         # サブプロット作成（価格チャートと出来高）
         fig = make_subplots(
@@ -335,11 +339,13 @@ def create_candlestick_chart(ticker: str, period: str, interval: str):
         return None
 
 
-def create_mini_chart(ticker: str, df: pd.DataFrame) -> go.Figure:
+def create_mini_chart(ticker: str, df: pd.DataFrame, title_dict: dict = None) -> go.Figure:
     """
     グリッド表示用のミニチャートを作成
     """
-    title_jp = TITLE_DICT.get(ticker, ticker)
+    if title_dict is None:
+        title_dict = TITLE_DICT
+    title_jp = title_dict.get(ticker, ticker)
     
     fig = go.Figure()
     
@@ -372,49 +378,46 @@ def render_chart_page() -> None:
     st.title("📊 チャートの表示")
     st.write("銘柄のローソク足チャートをインタラクティブに表示します。")
     
-    # 期間と足種の設定
-    col1, col2, col3 = st.columns([2, 2, 2])
+    # サイドバーから選択された区分に応じて銘柄リストを取得
+    position = st.session_state.get("sidebar_position", "保有株")
+    tickers, title_dict = get_tickers_and_names(position)
     
-    with col1:
-        # サイドバーから期間設定を取得
-        period_map = {
-            "3ヶ月": "3mo",
-            "半年": "6mo",
-            "1年": "1y",
-            "3年": "3y"
-        }
-        period_label = st.session_state.get("sidebar_period", "3ヶ月")
-        period = period_map.get(period_label, "3mo")
-        st.info(f"📅 期間: {period_label}")
+    if not tickers:
+        st.warning("銘柄データが読み込めませんでした。")
+        return
     
-    with col2:
-        interval = st.selectbox(
-            "🕐 足種",
-            options=["1d", "1wk", "1mo"],
-            format_func=lambda x: {
-                "1d": "日足",
-                "1wk": "週足",
-                "1mo": "月足"
-            }[x],
-            index=0,
-            key="chart_interval"
-        )
+    # サイドバーから期間設定を取得し、足種を自動判定
+    period_map = {
+        "3ヶ月": "3mo",
+        "半年": "6mo",
+        "1年": "1y",
+        "3年": "3y"
+    }
+    period_label = st.session_state.get("sidebar_period", "3ヶ月")
+    period = period_map.get(period_label, "3mo")
     
-    with col3:
-        display_mode = st.selectbox(
-            "📱 表示モード",
-            options=["個別表示（タブ）", "一覧表示（グリッド）"],
-            index=0,
-            key="display_mode"
-        )
+    # 期間によって足種を自動設定
+    if period in ["3mo", "6mo"]:
+        interval = "1d"  # 日足
+    else:
+        interval = "1wk"  # 週足
     
+    # 表示モード選択（省スペース）
+    display_mode = st.radio(
+        "表示モード",
+        options=["個別表示（タブ）", "一覧表示（グリッド）"],
+        horizontal=True,
+        key="display_mode"
+    )
+    
+    # st.caption(f"📊 期間: {period_label} / 足種: {interval_label}")
     st.divider()
     
     # データ取得とキャッシュ
     @st.cache_data(ttl=300)  # 5分間キャッシュ
-    def load_all_data(period: str, interval: str):
+    def load_all_data(tickers: list, period: str, interval: str):
         data = {}
-        for ticker in TICKERS:
+        for ticker in tickers:
             try:
                 df = fetch_stock_data(ticker, period, interval)
                 if not df.empty:
@@ -424,7 +427,7 @@ def render_chart_page() -> None:
         return data
     
     with st.spinner("データを取得中..."):
-        all_data = load_all_data(period, interval)
+        all_data = load_all_data(tickers, period, interval)
     
     if not all_data:
         st.error("データの取得に失敗しました。")
@@ -433,11 +436,11 @@ def render_chart_page() -> None:
     # 表示モードによって切り替え
     if display_mode == "個別表示（タブ）":
         # タブで個別表示
-        tabs = st.tabs([TITLE_DICT.get(ticker, ticker) for ticker in TICKERS if ticker in all_data])
+        tabs = st.tabs([title_dict.get(ticker, ticker) for ticker in tickers if ticker in all_data])
         
-        for idx, ticker in enumerate([t for t in TICKERS if t in all_data]):
+        for idx, ticker in enumerate([t for t in tickers if t in all_data]):
             with tabs[idx]:
-                fig = create_candlestick_chart(ticker, period, interval)
+                fig = create_candlestick_chart(ticker, period, interval, title_dict)
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
                     
@@ -459,10 +462,10 @@ def render_chart_page() -> None:
     
     else:
         # グリッド表示（2列）
-        st.info("💡 各チャートをクリックすると拡大できます。")
+        # st.info("💡 各チャートをクリックすると拡大できます。")
         cols_per_row = 2
         
-        tickers_with_data = [t for t in TICKERS if t in all_data]
+        tickers_with_data = [t for t in tickers if t in all_data]
         for i in range(0, len(tickers_with_data), cols_per_row):
             cols = st.columns(cols_per_row)
             for j in range(cols_per_row):
@@ -470,7 +473,7 @@ def render_chart_page() -> None:
                 if idx < len(tickers_with_data):
                     ticker = tickers_with_data[idx]
                     with cols[j]:
-                        fig = create_mini_chart(ticker, all_data[ticker])
+                        fig = create_mini_chart(ticker, all_data[ticker], title_dict)
                         st.plotly_chart(fig, use_container_width=True)
     
     st.divider()
@@ -548,7 +551,7 @@ def analyze_signals(df: pd.DataFrame) -> tuple:
     return buy_signal, sell_signal, " / ".join(comments)
 
 
-def create_trend_chart(df: pd.DataFrame, ticker: str, comment_text: str) -> go.Figure:
+def create_trend_chart(df: pd.DataFrame, ticker: str, comment_text: str, title_dict: dict = None) -> go.Figure:
     """
     テクニカル分析チャートを作成
     """
@@ -619,7 +622,9 @@ def create_trend_chart(df: pd.DataFrame, ticker: str, comment_text: str) -> go.F
         bgcolor="white"
     )
     
-    title_jp = TITLE_DICT.get(ticker, ticker)
+    if title_dict is None:
+        title_dict = TITLE_DICT
+    title_jp = title_dict.get(ticker, ticker)
     fig.update_layout(
         title=f"{title_jp} ({ticker}) 株価とテクニカル分析",
         xaxis_rangeslider_visible=False,
@@ -639,47 +644,46 @@ def render_trend_analysis_page() -> None:
     st.title("📉 傾向分析")
     st.write("テクニカル指標（SMA, RSI, MACD）を使って買い/売りシグナルを分析します。")
     
-    # 設定
-    col1, col2, col3 = st.columns([2, 2, 2])
+    # サイドバーから選択された区分に応じて銘柄リストを取得
+    position = st.session_state.get("sidebar_position", "保有株")
+    tickers, title_dict = get_tickers_and_names(position)
     
-    with col1:
-        period_map = {
-            "3ヶ月": "3mo",
-            "半年": "6mo",
-            "1年": "1y",
-            "3年": "3y"
-        }
-        period_label = st.session_state.get("sidebar_period", "3ヶ月")
-        period = period_map.get(period_label, "3mo")
-        st.info(f"📅 期間: {period_label}")
+    if not tickers:
+        st.warning("銘柄データが読み込めませんでした。")
+        return
     
-    with col2:
-        interval = st.selectbox(
-            "🕐 足種",
-            options=["1d", "1wk"],
-            format_func=lambda x: {
-                "1d": "日足",
-                "1wk": "週足"
-            }[x],
-            index=0,
-            key="trend_interval"
-        )
+    # サイドバーから期間設定を取得し、足種を自動判定
+    period_map = {
+        "3ヶ月": "3mo",
+        "半年": "6mo",
+        "1年": "1y",
+        "3年": "3y"
+    }
+    period_label = st.session_state.get("sidebar_period", "3ヶ月")
+    period = period_map.get(period_label, "3mo")
     
-    with col3:
-        display_mode = st.selectbox(
-            "📱 表示モード",
-            options=["個別表示（タブ）", "一覧表示（縦並び）"],
-            index=0,
-            key="trend_display_mode"
-        )
+    # 期間によって足種を自動設定
+    if period in ["3mo", "6mo"]:
+        interval = "1d"  # 日足
+    else:
+        interval = "1wk"  # 週足
     
+    # 表示モード選択（省スペース）
+    display_mode = st.radio(
+        "表示モード",
+        options=["個別表示（タブ）", "一覧表示（縦並び）"],
+        horizontal=True,
+        key="trend_display_mode"
+    )
+    
+    # st.caption(f"📊 期間: {period_label} / 足種: {interval_label}")
     st.divider()
     
     # データ取得と分析
     @st.cache_data(ttl=300)
-    def load_and_analyze_data(period: str, interval: str):
+    def load_and_analyze_data(tickers: list, period: str, interval: str):
         results = {}
-        for ticker in TICKERS:
+        for ticker in tickers:
             try:
                 df = fetch_stock_data(ticker, period, interval)
                 if not df.empty and len(df) >= 20:  # 最低20日分のデータが必要
@@ -696,7 +700,7 @@ def render_trend_analysis_page() -> None:
         return results
     
     with st.spinner("テクニカル分析中..."):
-        analysis_results = load_and_analyze_data(period, interval)
+        analysis_results = load_and_analyze_data(tickers, period, interval)
     
     if not analysis_results:
         st.error("データの取得に失敗しました。")
@@ -719,12 +723,12 @@ def render_trend_analysis_page() -> None:
     
     # 表示モード別の描画
     if display_mode == "個別表示（タブ）":
-        tabs = st.tabs([TITLE_DICT.get(ticker, ticker) for ticker in TICKERS if ticker in analysis_results])
+        tabs = st.tabs([title_dict.get(ticker, ticker) for ticker in tickers if ticker in analysis_results])
         
-        for idx, ticker in enumerate([t for t in TICKERS if t in analysis_results]):
+        for idx, ticker in enumerate([t for t in tickers if t in analysis_results]):
             with tabs[idx]:
                 result = analysis_results[ticker]
-                fig = create_trend_chart(result['df'], ticker, result['comment'])
+                fig = create_trend_chart(result['df'], ticker, result['comment'], title_dict)
                 st.plotly_chart(fig, use_container_width=True)
                 
                 # シグナル表示
@@ -738,13 +742,13 @@ def render_trend_analysis_page() -> None:
                 st.caption(result['comment'])
     else:
         # 一覧表示
-        for ticker in TICKERS:
+        for ticker in tickers:
             if ticker in analysis_results:
                 result = analysis_results[ticker]
-                title_jp = TITLE_DICT.get(ticker, ticker)
+                title_jp = title_dict.get(ticker, ticker)
                 
                 st.subheader(f"{title_jp} ({ticker})")
-                fig = create_trend_chart(result['df'], ticker, result['comment'])
+                fig = create_trend_chart(result['df'], ticker, result['comment'], title_dict)
                 st.plotly_chart(fig, use_container_width=True)
                 
                 if result['buy_signal']:
