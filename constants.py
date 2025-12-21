@@ -101,3 +101,32 @@ MENU_OPTIONS = [
     MENU_TREND,
     MENU_STOCK_REVIEW,
 ]
+
+# ===== キャッシュ設定 =====
+CACHE_FILE_PATH = "ipo_cache.pkl"
+CACHE_EXPIRY_DAYS = 7  # キャッシュの有効期限（日数）
+
+# ===== チャート表示設定 =====
+TICKERS = [
+    '2590.T', '4587.T', '7686.T', '9603.T', '6619.T', 
+    '192A.T', '3985.T', '4584.T', '5032.T', '5574.T', 
+    '5591.T', '7779.T', '6521.T', '5871.T', '5586.T'
+]
+
+TITLE_DICT = {
+    '2590.T': 'DyDoGroup',
+    '4587.T': 'PeptiDream',
+    '7686.T': 'Hitomairu(KAKUYASU)',
+    '9603.T': 'HIS',
+    '6619.T': 'W_Scope',
+    '192A.T': 'Integrupe',
+    '3985.T': 'Temona',
+    '4584.T': 'KidswellBio',
+    '5032.T': 'ANYCOLOR',
+    '5574.T': 'ABEJA',
+    '5591.T': 'AVILEN',
+    '7779.T': 'CYBERDYNE',
+    '6521.T': 'Oxide',
+    '5871.T': 'SOLIZEHD',
+    '5586.T': 'LABOROAI'
+}

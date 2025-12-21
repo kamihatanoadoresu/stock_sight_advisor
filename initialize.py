@@ -4,7 +4,7 @@
 import streamlit as st
 from dotenv import load_dotenv
 
-from constants import APP_TITLE
+from constants import APP_TITLE, MENU_STOCK_REVIEW
 
 
 def load_environment() -> None:
@@ -36,6 +36,9 @@ def initialize_session_state() -> None:
 
     if "portfolio" not in st.session_state:
         st.session_state["portfolio"] = []
+    
+    if "selected_menu" not in st.session_state:
+        st.session_state["selected_menu"] = MENU_STOCK_REVIEW
 
 
 def initialize_app() -> None:
