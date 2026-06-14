@@ -71,8 +71,7 @@ def render_page(service: "StockAdvisorService") -> None:
 
     if selected_menu == MENU_STOCK_REVIEW:
         render_header()
-        render_input_form(service)
-        render_history()
+        render_stock_judge()
     elif selected_menu == MENU_CANDIDATE_STOCKS:
         render_promising_stocks()
     elif selected_menu == MENU_CHART:
@@ -165,6 +164,509 @@ def render_history() -> None:
             st.write(item["analysis_text"])
 
 
+@st.cache_data(ttl=3600)
+def fetch_fundamentals(ticker: str) -> dict:
+    """
+    基本的な財務指標をyfinanceから取得して正規化して返す（best-effort）
+    戻り値: dict of metrics (可能な限り値を埋める)
+    """
+    metrics = {}
+    try:
+        tk = yf.Ticker(ticker)
+
+        info = tk.info or {}
+
+        # 市場データ
+        metrics['marketCap'] = info.get('marketCap')
+        metrics['trailingPE'] = info.get('trailingPE')
+
+        # 財務諸表（年度・四半期ベースのDataFrameが返ることがある）
+        try:
+            bs = tk.balance_sheet
+        except Exception:
+            bs = None
+
+        try:
+            fin = tk.financials
+        except Exception:
+            fin = None
+
+        try:
+            earnings = tk.earnings
+        except Exception:
+            earnings = None
+
+        # 最新列を取得するヘルパー
+        def latest_from_df(df):
+            if df is None or df.empty:
+                return None
+            try:
+                return df.iloc[:, 0]
+            except Exception:
+                return None
+
+        bs_latest = latest_from_df(bs)
+        fin_latest = latest_from_df(fin)
+
+        # 総資産・自己資本（ラベルが多様なため、キーワードで緩やかに探索する）
+        def _find_in_series(s, patterns):
+            if s is None:
+                return None
+            try:
+                for idx in s.index:
+                    lab = str(idx).lower()
+                    for p in patterns:
+                        if p in lab:
+                            val = s.get(idx)
+                            if val is not None and (not (isinstance(val, float) and pd.isna(val))):
+                                return val
+                return None
+            except Exception:
+                return None
+
+        metrics['totalAssets'] = None
+        metrics['totalEquity'] = None
+        if bs_latest is not None:
+            metrics['totalAssets'] = _find_in_series(bs_latest, ['total asset', 'totalassets', 'totalasset', 'assets'])
+            metrics['totalEquity'] = _find_in_series(bs_latest, ['total stockholder', 'totalstockholder', 'totalstock', 'total shareholder', 'totalshareholder', 'total equity', 'totalequity', 'shareholders'])
+
+        # 有利子負債（候補）: info の totalDebt を優先、なければバランスシートから long/short debt を合算して探す
+        total_debt = None
+        if info.get('totalDebt') is not None:
+            total_debt = info.get('totalDebt')
+        else:
+            # try several debt-related labels in bs_latest
+            if bs_latest is not None:
+                td1 = _find_in_series(bs_latest, ['long term debt', 'longtermdebt', 'long term liabilities', 'long term borrowings'])
+                td2 = _find_in_series(bs_latest, ['short term debt', 'shorttermdebt', 'short term borrowings', 'short term liabilities'])
+                # 合算できるものは合算、なければ見つかったものを使う
+                try:
+                    vals = [v for v in [td1, td2] if v is not None]
+                    if vals:
+                        total_debt = sum(vals)
+                    else:
+                        # fallback: any label containing 'debt' or 'liab' might be usable
+                        total_debt = _find_in_series(bs_latest, ['debt', 'liab'])
+                except Exception:
+                    total_debt = None
+        metrics['totalDebt'] = total_debt
+
+        # 損益系（ラベルが多様なためパターンで探索）
+        metrics['revenue'] = None
+        metrics['operatingIncome'] = None
+        metrics['netIncome'] = None
+        if fin is not None and not fin.empty:
+            try:
+                # fin は DataFrame。行ラベルをキーワードで探索して最新列の値を取得する
+                def _find_label_in_df(df, patterns):
+                    for idx in df.index:
+                        lab = str(idx).lower()
+                        for p in patterns:
+                            if p in lab:
+                                return idx
+                    return None
+
+                rev_label = _find_label_in_df(fin, ['total revenue', 'totalrevenue', 'revenue', 'sales'])
+                op_label = _find_label_in_df(fin, ['operating income', 'operatingincome', 'operating', 'total operating income', 'ebit'])
+                net_label = _find_label_in_df(fin, ['net income', 'netincome', 'net profit'])
+
+                def _first_nonnull_from_row(row):
+                    for v in row.values:
+                        try:
+                            if v is None:
+                                continue
+                            if isinstance(v, float) and pd.isna(v):
+                                continue
+                            return v
+                        except Exception:
+                            continue
+                    return None
+
+                if rev_label is not None:
+                    metrics['revenue'] = _first_nonnull_from_row(fin.loc[rev_label])
+                if op_label is not None:
+                    metrics['operatingIncome'] = _first_nonnull_from_row(fin.loc[op_label])
+                if net_label is not None:
+                    metrics['netIncome'] = _first_nonnull_from_row(fin.loc[net_label])
+            except Exception:
+                metrics['revenue'] = None
+                metrics['operatingIncome'] = None
+                metrics['netIncome'] = None
+
+        # EPS: 優先的にinfoの値
+        metrics['eps'] = info.get('trailingEps') or info.get('eps') or None
+        # 配当性向（payoutRatio）
+        metrics['payoutRatio'] = info.get('payoutRatio')
+
+        # EPS履歴（earnings DataFrameがあれば抽出） - best-effort
+        metrics['eps_history'] = None
+        try:
+            if earnings is not None and not earnings.empty:
+                # yfinance の earnings は列に 'Earnings' を持つことが多い
+                if 'Earnings' in earnings.columns:
+                    metrics['eps_history'] = earnings['Earnings'].astype(float).tolist()
+                else:
+                    # 他の列がある場合は最初の列を使う
+                    metrics['eps_history'] = earnings.iloc[:, 0].astype(float).tolist()
+        except Exception:
+            metrics['eps_history'] = None
+
+        # 優待改悪／廃止情報は外部ソースが必要なため未実装（N/A）
+        metrics['benefit_change_announced'] = None
+
+        # 収益性などの比率
+        try:
+            if metrics.get('totalAssets') is not None and metrics.get('totalEquity') is not None and metrics.get('totalAssets') != 0:
+                metrics['equityRatio'] = metrics['totalEquity'] / metrics['totalAssets']
+            else:
+                # yfinance may provide bookValue, totalAssets or returnOnEquity; try common fallbacks
+                try:
+                    ta_val = info.get('totalAssets')
+                    te_val = info.get('totalStockholderEquity') or info.get('totalShareHolderEquity') or info.get('totalEquity')
+                    if ta_val and te_val:
+                        metrics['equityRatio'] = te_val / ta_val
+                    else:
+                        metrics['equityRatio'] = None
+                except Exception:
+                    metrics['equityRatio'] = None
+        except Exception:
+            metrics['equityRatio'] = None
+
+        # ROE
+        try:
+            if metrics.get('netIncome') and metrics.get('totalEquity'):
+                metrics['ROE'] = metrics['netIncome'] / metrics['totalEquity']
+            else:
+                metrics['ROE'] = info.get('returnOnEquity')
+        except Exception:
+            metrics['ROE'] = None
+
+        # 営業利益率
+        try:
+            if metrics.get('operatingIncome') and metrics.get('revenue'):
+                metrics['operatingMargin'] = metrics['operatingIncome'] / metrics['revenue']
+            else:
+                metrics['operatingMargin'] = None
+        except Exception:
+            metrics['operatingMargin'] = None
+
+        # 成長率: ラベルをパターンで探して最新と前期で成長率を算出する（best-effort）
+        def _find_label_in_df(df, patterns):
+            if df is None:
+                return None
+            try:
+                for idx in df.index:
+                    lab = str(idx).lower()
+                    for p in patterns:
+                        if p in lab:
+                            return idx
+                return None
+            except Exception:
+                return None
+
+        def calc_growth_by_patterns(df, patterns):
+            if df is None or df.empty:
+                return None
+            lbl = _find_label_in_df(df, patterns)
+            if lbl is None:
+                return None
+            try:
+                row = df.loc[lbl]
+                # pick first two non-null values (latest first)
+                nonnull = []
+                for v in row.values:
+                    try:
+                        if v is None:
+                            continue
+                        if isinstance(v, float) and pd.isna(v):
+                            continue
+                        nonnull.append(v)
+                        if len(nonnull) >= 2:
+                            break
+                    except Exception:
+                        continue
+                if len(nonnull) < 2:
+                    return None
+                latest, prev = nonnull[0], nonnull[1]
+                if prev is None or prev == 0:
+                    return None
+                return (latest - prev) / abs(prev)
+            except Exception:
+                return None
+
+        metrics['revenueGrowth'] = None
+        metrics['operatingIncomeGrowth'] = None
+        if fin is not None and not fin.empty:
+            metrics['revenueGrowth'] = calc_growth_by_patterns(fin, ['total revenue', 'totalrevenue', 'revenue', 'sales'])
+            metrics['operatingIncomeGrowth'] = calc_growth_by_patterns(fin, ['operating income', 'operatingincome', 'operating', 'ebit'])
+
+        # PER
+        metrics['PER'] = info.get('trailingPE') or info.get('forwardPE')
+
+    except Exception:
+        return {}
+
+    return metrics
+
+
+def evaluate_buy_rules(metrics: dict) -> dict:
+    """
+    指定されたルールで判定を行い、各ルールごとの通過可否を返す
+    """
+    res = {}
+    # 優待目的
+    # compute debt/equity safely
+    _td = metrics.get('totalDebt')
+    _te = metrics.get('totalEquity')
+    try:
+        debt_equity_ok = (_td is not None and _te is not None and _te != 0 and (_td / _te) <= 1.0)
+    except Exception:
+        debt_equity_ok = False
+
+    res['yutai'] = {
+        '自己資本比率>=30%': metrics.get('equityRatio') is not None and metrics.get('equityRatio') >= 0.30,
+        '有利子負債自己資本比率<=100%': debt_equity_ok,
+        '経常利益(営業利益)が黒字': metrics.get('operatingIncome') is not None and metrics.get('operatingIncome') > 0,
+        'EPSが黒字': metrics.get('eps') is not None and metrics.get('eps') > 0,
+    }
+
+    # 最高益だが株価下落中（成長性重視）
+    res['growth_top'] = {
+        '経常利益成長率>=20%': metrics.get('operatingIncomeGrowth') is not None and metrics.get('operatingIncomeGrowth') >= 0.20,
+        '売上高成長率>=15%': metrics.get('revenueGrowth') is not None and metrics.get('revenueGrowth') >= 0.15,
+        '営業利益率>=10%': metrics.get('operatingMargin') is not None and metrics.get('operatingMargin') >= 0.10,
+        '自己資本比率>=40%': metrics.get('equityRatio') is not None and metrics.get('equityRatio') >= 0.40,
+        'ROE>=15%': metrics.get('ROE') is not None and metrics.get('ROE') >= 0.15,
+        'PER between 15 and 25': metrics.get('PER') is not None and (15 <= metrics.get('PER') <= 25),
+    }
+
+    # 上場5年以内・成長性志向
+    res['early_growth'] = {
+        '時価総額<=500億円': metrics.get('marketCap') is not None and metrics.get('marketCap') <= 500 * 10**8,  # 500億円
+        '売上高成長率>=20%': metrics.get('revenueGrowth') is not None and metrics.get('revenueGrowth') >= 0.20,
+        '経常利益成長率>=20%': metrics.get('operatingIncomeGrowth') is not None and metrics.get('operatingIncomeGrowth') >= 0.20,
+        '自己資本比率>=30%': metrics.get('equityRatio') is not None and metrics.get('equityRatio') >= 0.30,
+        '営業利益率>=10%': metrics.get('operatingMargin') is not None and metrics.get('operatingMargin') >= 0.10,
+        'PER between 15 and 30': metrics.get('PER') is not None and (15 <= metrics.get('PER') <= 30),
+    }
+
+    return res
+
+
+def evaluate_sell_rules(metrics: dict) -> dict:
+    """
+    売りロジックの判定を行う（優待株の指標 / キャピタルゲインの指標）
+    """
+    res = {}
+
+    # ① 優待株の指標（売りシグナル）
+    res['優待株の指標'] = {
+        '自己資本比率<=30%': metrics.get('equityRatio') is not None and metrics.get('equityRatio') <= 0.30,
+        'EPSが2期連続マイナス': False if metrics.get('eps_history') is None else (len(metrics.get('eps_history')) >= 2 and metrics.get('eps_history')[-1] < 0 and metrics.get('eps_history')[-2] < 0),
+        '優待改悪/廃止発表あり': True if metrics.get('benefit_change_announced') else False,
+        '配当性向>=80%': metrics.get('payoutRatio') is not None and metrics.get('payoutRatio') >= 0.80,
+    }
+
+    # ② キャピタルゲインの指標（売りシグナル）
+    res['キャピタルゲインの指標'] = {
+        '売上高成長率<=15%': metrics.get('revenueGrowth') is not None and metrics.get('revenueGrowth') <= 0.15,
+        '経常利益成長率<=20%': metrics.get('operatingIncomeGrowth') is not None and metrics.get('operatingIncomeGrowth') <= 0.20,
+        'PER>=30': metrics.get('PER') is not None and metrics.get('PER') >= 30,
+        '営業利益率<=5%': metrics.get('operatingMargin') is not None and metrics.get('operatingMargin') <= 0.05,
+    }
+
+    return res
+
+
+def render_stock_judge() -> None:
+    """
+    銘柄ドロップダウンで選択した銘柄について、条件達成表と最終ジャッジを表示
+    """
+    st.subheader("🔎 銘柄の条件チェック（簡易判定）")
+
+    # 表示名マップ（内部キー -> 表示ラベル）
+    section_title_map = {
+        'yutai': '優待目的の判定',
+        'growth_top': '配当金目的の判定',
+        'early_growth': 'キャピタルゲイン目的の判定'
+    }
+
+    # 表示用フォーマッタ（欠損値と nan を適切に N/A 表示にする）
+    def _is_missing(v):
+        try:
+            return v is None or (isinstance(v, float) and pd.isna(v))
+        except Exception:
+            return v is None
+
+    def fmt_num(v, precision=2):
+        if _is_missing(v):
+            return 'N/A'
+        try:
+            return f"{v:.{precision}f}"
+        except Exception:
+            return str(v)
+
+    def fmt_percent(v, precision=1):
+        if _is_missing(v):
+            return 'N/A'
+        try:
+            return f"{v*100:.{precision}f}%"
+        except Exception:
+            return str(v)
+
+    def fmt_money(v):
+        if _is_missing(v):
+            return 'N/A'
+        try:
+            return f"{int(v):,}"
+        except Exception:
+            return str(v)
+
+    # サイドバーの区分選択を使用する（重複 UI を避ける）
+    position = st.session_state.get('sidebar_position', '保有株')
+
+    # 売買の目的ラジオ（買いロジックは表示、売りは未実装表示）
+    intent = st.radio("目的を選択", options=["買いたい", "売りたい"], horizontal=True, key='judge_intent')
+
+    tickers, title_dict = get_tickers_and_names(position)
+
+    if not tickers:
+        st.info('銘柄リストが空です。stocks.jsonを確認してください。')
+        return
+
+    # ドロップダウンで銘柄選択
+    options = [f"{title_dict.get(t, t)} ({t})" for t in tickers]
+    choice = st.selectbox('銘柄を選択してください', options, key='judge_ticker')
+    selected_ticker = choice.split('(')[-1].strip(')')
+
+    if intent == '売りたい':
+        # 売りロジックを実行して表示
+        with st.spinner('財務データ取得中...'):
+            metrics = fetch_fundamentals(selected_ticker)
+
+        if not metrics:
+            st.error('財務データが取得できませんでした。')
+            return
+
+        sell_evals = evaluate_sell_rules(metrics)
+
+        for section, checks in sell_evals.items():
+            st.markdown(f"**{section} の判定**")
+            rows = []
+            for k, v in checks.items():
+                val = v
+                metric_display = ''
+                try:
+                    if '自己資本比率' in k:
+                        metric_display = fmt_percent(metrics.get('equityRatio'), precision=2)
+                    if 'EPS' in k:
+                        # EPS履歴の末尾2期を表示
+                        eps_hist = metrics.get('eps_history')
+                        if eps_hist and len(eps_hist) >= 2:
+                            metric_display = f"{fmt_num(eps_hist[-2],2)}, {fmt_num(eps_hist[-1],2)}"
+                        elif metrics.get('eps') is not None:
+                            metric_display = fmt_num(metrics.get('eps'), 2)
+                        else:
+                            metric_display = 'N/A'
+                    if '優待改悪' in k or '廃止' in k:
+                        metric_display = 'あり' if metrics.get('benefit_change_announced') else 'N/A'
+                    if '配当性向' in k:
+                        metric_display = fmt_percent(metrics.get('payoutRatio'), precision=1)
+                    if '売上高成長率' in k:
+                        metric_display = fmt_percent(metrics.get('revenueGrowth'), precision=1)
+                    if '経常利益成長率' in k:
+                        metric_display = fmt_percent(metrics.get('operatingIncomeGrowth'), precision=1)
+                    if 'PER' in k:
+                        metric_display = fmt_num(metrics.get('PER'), precision=2)
+                    if '営業利益率' in k:
+                        metric_display = fmt_percent(metrics.get('operatingMargin'), precision=1)
+                except Exception:
+                    metric_display = 'N/A'
+
+                rows.append({
+                    '判定項目': k,
+                    '該当': '✅' if val else '❌',
+                    '値': metric_display
+                })
+
+            df_checks = pd.DataFrame(rows)
+            st.dataframe(df_checks, use_container_width=True)
+
+        # 最終ジャッジ（単純まとめ）
+        final_sell = any(all(v for v in checks.values()) for checks in sell_evals.values())
+        if final_sell:
+            st.warning('総合判定: 売却を検討する条件が揃っています（注意検討）')
+        else:
+            st.info('総合判定: 現時点で売却条件は揃っていません。')
+        return
+
+    # 以下は「買いたい」を選択した場合の表示（買いロジック）
+    with st.spinner('財務データ取得中...'):
+        metrics = fetch_fundamentals(selected_ticker)
+
+    if not metrics:
+        st.error('財務データが取得できませんでした。')
+        return
+
+    # 評価
+    evals = evaluate_buy_rules(metrics)
+
+    # 表を作成して表示（買いルールのみ）
+    for section, checks in evals.items():
+        display_title = section_title_map.get(section, section)
+        st.markdown(f"**{display_title}**")
+        rows = []
+        for k, v in checks.items():
+            val = v
+            metric_display = ''
+            # 表示用の実数値を補足
+            try:
+                if '自己資本比率' in k:
+                    metric_display = fmt_percent(metrics.get('equityRatio'), precision=2)
+                if '有利子負債' in k:
+                    td = metrics.get('totalDebt')
+                    te = metrics.get('totalEquity')
+                    try:
+                        if td is not None and te is not None and te != 0:
+                            metric_display = fmt_num(td / te, precision=2)
+                        else:
+                            metric_display = 'N/A'
+                    except Exception:
+                        metric_display = 'N/A'
+                if 'EPS' in k:
+                    metric_display = fmt_num(metrics.get('eps'), 2)
+                if '経常利益成長率' in k or '売上高成長率' in k:
+                    key = 'operatingIncomeGrowth' if '経常利益' in k else 'revenueGrowth'
+                    metric_display = fmt_percent(metrics.get(key), precision=1)
+                if '営業利益率' in k:
+                    metric_display = fmt_percent(metrics.get('operatingMargin'), precision=1)
+                if 'ROE' in k:
+                    metric_display = fmt_percent(metrics.get('ROE'), precision=1)
+                if 'PER' in k:
+                    metric_display = fmt_num(metrics.get('PER'), precision=2)
+                if '時価総額' in k:
+                    metric_display = fmt_money(metrics.get('marketCap'))
+            except Exception:
+                metric_display = 'N/A'
+
+            rows.append({
+                '判定項目': k,
+                '達成': '✅' if val else '❌',
+                '値': metric_display
+            })
+
+        df_checks = pd.DataFrame(rows)
+        st.dataframe(df_checks, use_container_width=True)
+
+    # 最終ジャッジ（単純まとめ）
+    final_buy = any(all(v for v in checks.values()) for checks in evals.values())
+    if final_buy:
+        st.success('総合判定: 買っても良い可能性があります（基準を満たすカテゴリあり）')
+    else:
+        st.info('総合判定: すぐに買う条件は満たしていません。追加確認を推奨します。')
+
+
+
 def render_promising_stocks() -> None:
     """
     有力IPO銘柄一覧を表示
@@ -180,6 +682,26 @@ def render_promising_stocks() -> None:
     )
 
     service = IPOStockService()
+
+    # failed tickers のサマリ表示と再試行ボタン
+    try:
+        failed_list = service.get_failed_tickers()
+    except Exception:
+        failed_list = []
+
+    if failed_list:
+        st.info(f"⏭ スキップ中の銘柄: {len(failed_list)}件があります。")
+        with st.expander("スキップ銘柄一覧（クリックで展開）"):
+            for tk in failed_list:
+                st.write(tk)
+
+        if st.button("スキップ解除して再試行"):
+            with st.spinner("スキップ解除・再取得中..."):
+                service.clear_failed_tickers()
+                df = service.get_promising_ipos()
+            st.session_state["promising_stocks_df"] = df
+            st.success("再取得が完了しました。結果を表示します。")
+            return
 
     # キャッシュの確認
     cached_df, cached_timestamp = service.load_cache()
@@ -402,10 +924,13 @@ def render_chart_page() -> None:
     else:
         interval = "1wk"  # 週足
     
-    # 表示モード選択（省スペース）
+    # 表示モード選択（省スペース） — デフォルトを一覧表示(グリッド)にし、順序を入れ替え
+    chart_options = ["一覧表示（グリッド）", "個別表示（タブ）"]
+    display_mode_index = 0 if "display_mode" not in st.session_state else (chart_options.index(st.session_state.get("display_mode")) if st.session_state.get("display_mode") in chart_options else 0)
     display_mode = st.radio(
         "表示モード",
-        options=["個別表示（タブ）", "一覧表示（グリッド）"],
+        options=chart_options,
+        index=display_mode_index,
         horizontal=True,
         key="display_mode"
     )
@@ -668,10 +1193,13 @@ def render_trend_analysis_page() -> None:
     else:
         interval = "1wk"  # 週足
     
-    # 表示モード選択（省スペース）
+    # 表示モード選択（省スペース） — デフォルトを一覧表示(縦並び)にし、順序を入れ替え
+    trend_options = ["一覧表示（縦並び）", "個別表示（タブ）"]
+    trend_mode_index = 0 if "trend_display_mode" not in st.session_state else (trend_options.index(st.session_state.get("trend_display_mode")) if st.session_state.get("trend_display_mode") in trend_options else 0)
     display_mode = st.radio(
         "表示モード",
-        options=["個別表示（タブ）", "一覧表示（縦並び）"],
+        options=trend_options,
+        index=trend_mode_index,
         horizontal=True,
         key="trend_display_mode"
     )

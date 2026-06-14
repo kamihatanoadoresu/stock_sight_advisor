@@ -81,6 +81,7 @@ class StockAdvisorService:
 # データ取得・分析ロジック（Service層）
 
 import re
+import json
 import pickle
 import os
 from datetime import datetime, timedelta
@@ -92,6 +93,9 @@ from bs4 import BeautifulSoup
 import streamlit as st
 
 from constants import CACHE_FILE_PATH, CACHE_EXPIRY_DAYS
+
+# 失敗したティッカーのキャッシュファイル
+FAILED_TICKERS_PATH = "failed_tickers.json"
 
 
 class IPOStockService:
@@ -180,17 +184,131 @@ class IPOStockService:
     def get_current_prices(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         df["現在株価"] = None
+        # 可能であれば yfinance.download を使って小分けで一括取得し、失敗トークンをスキップする
+        codes = [str(df.at[i, "証券コード"]).zfill(4) + ".T" for i in df.index]
 
-        for i in df.index:
-            code = df.at[i, "証券コード"].zfill(4) + ".T"
+        # --- failed tickers キャッシュをロードし、TTL 内のものはスキップ ---
+        def _load_failed_tickers():
+            try:
+                if not os.path.exists(FAILED_TICKERS_PATH):
+                    return {}
+                with open(FAILED_TICKERS_PATH, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                # TTL チェック（CACHE_EXPIRY_DAYS を利用）
+                valid = {}
+                now = datetime.now()
+                for tk, ts in data.items():
+                    try:
+                        t = datetime.fromisoformat(ts)
+                        if now - t < timedelta(days=CACHE_EXPIRY_DAYS):
+                            valid[tk] = ts
+                    except Exception:
+                        continue
+                # 保存を更新（古いエントリ削除）
+                with open(FAILED_TICKERS_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(valid, f, ensure_ascii=False, indent=2)
+                return valid
+            except Exception:
+                return {}
+
+        def _add_failed_ticker(ticker: str):
+            try:
+                data = {}
+                if os.path.exists(FAILED_TICKERS_PATH):
+                    with open(FAILED_TICKERS_PATH, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                data[ticker] = datetime.now().isoformat()
+                with open(FAILED_TICKERS_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        def _remove_failed_ticker(ticker: str):
+            try:
+                if not os.path.exists(FAILED_TICKERS_PATH):
+                    return
+                with open(FAILED_TICKERS_PATH, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if ticker in data:
+                    del data[ticker]
+                    with open(FAILED_TICKERS_PATH, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        failed_cache = _load_failed_tickers()
+        skip_codes = set([c for c in codes if c in failed_cache])
+
+        # 実際に試行するコード群
+        trial_codes = [c for c in codes if c not in skip_codes]
+
+        def _assign_from_bulk(bulk, codes_subset):
+            if bulk is None or bulk.empty:
+                return []
+            failed = []
+            # bulk may be multiindexed (ticker, field) or single
+            for code in codes_subset:
+                try:
+                    if isinstance(bulk.columns, pd.MultiIndex):
+                        if (code, 'Close') in bulk.columns:
+                            val = bulk[(code, 'Close')].dropna()
+                            if not val.empty:
+                                idx = df.index[codes.index(code)]
+                                df.at[idx, "現在株価"] = round(val.iloc[-1])
+                            else:
+                                failed.append(code)
+                        else:
+                            failed.append(code)
+                    else:
+                        # single ticker case: try to read 'Close'
+                        if 'Close' in bulk.columns:
+                            val = bulk['Close'].dropna()
+                            if not val.empty:
+                                idx = df.index[codes.index(code)]
+                                df.at[idx, "現在株価"] = round(val.iloc[-1])
+                            else:
+                                failed.append(code)
+                        else:
+                            failed.append(code)
+                except Exception:
+                    failed.append(code)
+            return failed
+
+        # 小分けバッチ（例えば 10 件ずつ）で取得を試みる
+        batch_size = 10
+        remaining = []
+        for i in range(0, len(trial_codes), batch_size):
+            subset = trial_codes[i : i + batch_size]
+            try:
+                bulk = yf.download(tickers=subset, period="1d", interval="1d", group_by='ticker', threads=False, progress=False)
+                failed = _assign_from_bulk(bulk, subset)
+                remaining.extend(failed)
+            except Exception:
+                # バルク失敗時は個別取得へフォールバック（ただし短時間で切り上げる）
+                remaining.extend(subset)
+
+        # 個別フォールバック（残った銘柄のみ）
+        for code in remaining:
             try:
                 ticker = yf.Ticker(code)
                 data = ticker.history(period="1d")
-
                 if not data.empty:
-                    df.at[i, "現在株価"] = round(data["Close"].iloc[-1])
+                    idx = df.index[codes.index(code)]
+                    df.at[idx, "現在株価"] = round(data["Close"].iloc[-1])
+                    # 成功したら failed キャッシュから削除
+                    _remove_failed_ticker(code)
+                else:
+                    # 失敗ならキャッシュに追加
+                    _add_failed_ticker(code)
             except Exception:
-                pass
+                # 失敗としてキャッシュに追加して継続
+                _add_failed_ticker(code)
+                continue
+
+        # 既にスキップしていたコードはログに残すが処理継続
+        for code in skip_codes:
+            # skipされたコードはキャッシュに入っているため何もしない
+            continue
 
         return df
 
@@ -339,6 +457,28 @@ class IPOStockService:
                 pickle.dump(cache_data, f)
         except Exception as e:
             st.warning(f"キャッシュの保存に失敗しました: {e}")
+
+    # ---------------------------
+    # failed tickers キャッシュ管理用の公開API
+    # ---------------------------
+    def get_failed_tickers(self) -> list:
+        """現在キャッシュにある failed tickers の一覧を返す"""
+        try:
+            if not os.path.exists(FAILED_TICKERS_PATH):
+                return []
+            with open(FAILED_TICKERS_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return list(data.keys())
+        except Exception:
+            return []
+
+    def clear_failed_tickers(self) -> None:
+        """failed tickers キャッシュを削除する"""
+        try:
+            if os.path.exists(FAILED_TICKERS_PATH):
+                os.remove(FAILED_TICKERS_PATH)
+        except Exception:
+            pass
 
     def load_cache(self) -> tuple[pd.DataFrame | None, datetime | None]:
         """
